@@ -1,6 +1,6 @@
 {
-	"id": "canvas-kit-dev",
-	"name": "Canvas Kit Dev",
+	"id": "canvas-kit",
+	"name": "Canvas Kit",
 	"version": "0.2.5",
 	"minAppVersion": "1.5.0",
 	"description": "A FigJam-style annotation toolbar for Canvas: marker, highlighter, washi tape, eraser, frameless text, cards, sections, and tables.",
