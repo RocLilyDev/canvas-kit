@@ -625,6 +625,24 @@ interface PencilStroke {
 	shape?: "line" | "closed";
 }
 
+interface CanvasEdgeEndLike {
+	node?: CanvasNodeLike;
+	side?: string;
+}
+
+interface CanvasEdgeLike {
+	from?: CanvasEdgeEndLike;
+	to?: CanvasEdgeEndLike;
+	render?: () => void;
+	updatePath?: () => void;
+	getData?: () => Record<string, unknown>;
+	setData?: (data: Record<string, unknown>) => void;
+	unknownData?: Record<string, unknown>;
+	/** Canvas Kit bookkeeping (see patchEdgeForRows / syncRowEdges). */
+	cpRowPatched?: boolean;
+	cpRowSeen?: boolean;
+}
+
 interface CanvasNodeLike {
 	nodeEl?: HTMLElement;
 	text?: string;
@@ -633,6 +651,8 @@ interface CanvasNodeLike {
 	width?: number;
 	height?: number;
 	startEditing?: () => void;
+	/** Starts Obsidian's own drag-to-connect from one of the four node sides. */
+	onConnectionPointerdown?: (e: PointerEvent, side: string) => void;
 	getData?: () => Record<string, unknown>;
 	setData?: (data: Record<string, unknown>) => void;
 	moveAndResize?: (r: { x: number; y: number; width: number; height: number }) => void;
@@ -642,6 +662,7 @@ interface CanvasNodeLike {
 interface CanvasLike {
 	wrapperEl: HTMLElement;
 	nodes?: Map<string, CanvasNodeLike>;
+	edges?: Map<string, CanvasEdgeLike>;
 	posFromEvt?: (evt: { clientX: number; clientY: number }) => { x: number; y: number };
 	createTextNode?: (opts: {
 		pos: { x: number; y: number };
@@ -2813,6 +2834,14 @@ class CanvasToolbar {
 					}
 				}
 				this.mountTableWidget(node, el);
+				applyTableColor(node, el);
+				// Obsidian's color button only rewrites the node's inline style, which
+				// the class-only selection observer doesn't see.
+				if (!el.dataset.cpColorWatch) {
+					el.dataset.cpColorWatch = "1";
+					const mo = new MutationObserver(() => applyTableColor(node, el));
+					mo.observe(el, { attributes: true, attributeFilter: ["style", "class"] });
+				}
 				if (el.hasClass("is-focused") || el.hasClass("is-selected")) tableSelected = true;
 			} else {
 				// A plain Obsidian text card. While it's still empty, offer the
@@ -2836,6 +2865,36 @@ class CanvasToolbar {
 		// While a table is selected, CSS nudges Obsidian's floating node menu up
 		// so it doesn't cover the column-reorder handles above the table edge.
 		canvas.wrapperEl.toggleClass("canvas-kit-table-selected", tableSelected);
+		this.syncRowEdges();
+	}
+
+	/**
+	 * Keep row-anchored edges patched (they're rebuilt on load/undo), and catch
+	 * an edge dropped onto a row port so it lands on that row too.
+	 */
+	private syncRowEdges() {
+		const canvas = this.view.canvas;
+		if (!canvas?.edges) return;
+		for (const edge of canvas.edges.values()) {
+			if (!edge.cpRowSeen) {
+				edge.cpRowSeen = true;
+				const hover = lastRowPortHover;
+				if (
+					hover &&
+					Date.now() - hover.at < 3000 &&
+					edge.to?.node === hover.node &&
+					edgeRowOf(edge, "to") === null
+				) {
+					setEdgeRow(edge, "to", hover.row);
+					lastRowPortHover = null;
+					canvas.requestSave?.();
+				}
+			}
+			if (edgeRowOf(edge, "from") === null && edgeRowOf(edge, "to") === null) continue;
+			const fresh = !edge.cpRowPatched;
+			patchEdgeForRows(edge);
+			if (fresh) edge.render?.();
+		}
 	}
 
 	/** Snap an ink node's box back to its drawing's aspect ratio after a resize. */
@@ -4290,6 +4349,103 @@ function tableDims(
 // HTML table that fills the node. Click once to select the node (canvas resize
 // handles), click a cell while selected to edit it. Hovering shows "+" pills to
 // append a row/column and drag handles to reorder rows/columns.
+//
+// Tables also get a connection port per row on the left and right edges, so an
+// edge can start (or land) at a specific row instead of the node's side
+// midpoint. The row lives on the edge as pencilFromRow / pencilToRow; see
+// patchEdgeForRows for how the endpoint is moved onto that row.
+
+const EDGE_ROW_KEY = { from: "pencilFromRow", to: "pencilToRow" } as const;
+
+/** Last row port the pointer was over — lets a drop onto a port stamp its row. */
+let lastRowPortHover: { node: CanvasNodeLike; row: number; at: number } | null = null;
+
+function edgeRowOf(edge: CanvasEdgeLike, end: "from" | "to"): number | null {
+	const key = EDGE_ROW_KEY[end];
+	const v = edge.getData?.()[key] ?? edge.unknownData?.[key];
+	return typeof v === "number" ? v : null;
+}
+
+function setEdgeRow(edge: CanvasEdgeLike, end: "from" | "to", row: number | null) {
+	const key = EDGE_ROW_KEY[end];
+	try {
+		if (edge.unknownData) {
+			if (row === null) delete edge.unknownData[key];
+			else edge.unknownData[key] = row;
+		}
+		if (edge.getData && edge.setData) {
+			const d = edge.getData();
+			if (row === null) delete d[key];
+			else d[key] = row;
+			edge.setData(d);
+		}
+	} catch (err) {
+		console.warn("Canvas Kit: couldn't tag edge row", err);
+	}
+}
+
+/**
+ * The world-space vertical band a table row occupies. Derived from the stored
+ * row heights scaled to the node box, so it works without the node's DOM.
+ */
+function rowBandFor(node: CanvasNodeLike, row: number): { y: number; h: number } | null {
+	const heights = (node.getData?.().pencilRows ?? node.unknownData?.pencilRows) as unknown;
+	if (!Array.isArray(heights) || !heights.length) return null;
+	const top = node.y;
+	const height = node.height;
+	if (top == null || !height) return null;
+	const hs = heights.map((n) => (isFinite(Number(n)) ? Number(n) : 0));
+	const total = hs.reduce((s, n) => s + n, 0);
+	if (total <= 0) return null;
+	const i = Math.max(0, Math.min(hs.length - 1, Math.round(row)));
+	let before = 0;
+	for (let k = 0; k < i; k++) before += hs[k];
+	return { y: top + (before / total) * height, h: (hs[i] / total) * height };
+}
+
+/** Guards against re-entrant banding (render() calls updatePath() internally). */
+let edgeBanding = false;
+
+/**
+ * Obsidian's edge geometry always anchors at the midpoint of a node side, and
+ * the file format has no room for a finer anchor. So while a row-anchored edge
+ * renders, the node box is briefly shrunk to that row's band — the native math
+ * then puts the endpoint exactly on the row — and restored straight after.
+ */
+function patchEdgeForRows(edge: CanvasEdgeLike) {
+	if (edge.cpRowPatched) return;
+	edge.cpRowPatched = true;
+	for (const name of ["render", "updatePath"] as const) {
+		const orig = edge[name];
+		if (typeof orig !== "function") continue;
+		edge[name] = function (this: unknown) {
+			if (edgeBanding) return orig.call(this);
+			const restore: (() => void)[] = [];
+			for (const end of ["from", "to"] as const) {
+				const node = edge[end]?.node;
+				if (!node) continue;
+				const row = edgeRowOf(edge, end);
+				const band = row === null ? null : rowBandFor(node, row);
+				if (!band) continue;
+				const y = node.y;
+				const h = node.height;
+				node.y = band.y;
+				node.height = band.h;
+				restore.push(() => {
+					node.y = y;
+					node.height = h;
+				});
+			}
+			edgeBanding = true;
+			try {
+				orig.call(this);
+			} finally {
+				edgeBanding = false;
+				for (const fn of restore) fn();
+			}
+		};
+	}
+}
 
 class TableWidget {
 	renderedText = "";
@@ -4305,6 +4461,9 @@ class TableWidget {
 	private rowHandles: HTMLElement[] = [];
 	private colDividers: HTMLElement[] = [];
 	private rowDividers: HTMLElement[] = [];
+	private rowPorts: { el: HTMLElement; side: "left" | "right"; row: number }[] = [];
+	private portsHot = false;
+	private prevNodeZ: string | null = null;
 	private insertColDots: HTMLElement[] = [];
 	private insertRowDots: HTMLElement[] = [];
 	private insertLineEl: HTMLElement | null = null;
@@ -4370,6 +4529,7 @@ class TableWidget {
 		if (parsed) this.cells = parsed;
 		this.editingCell = null;
 		this.loadSizes();
+		this.setPortsHot(false); // ports are about to be rebuilt
 		this.clearLineSelection(); // drop stale selection + its document listeners
 
 		this.content.empty();
@@ -4462,6 +4622,20 @@ class TableWidget {
 			}
 		}
 
+		// Connection ports: one per row on each side, so an edge can attach to a
+		// single row instead of the node's side midpoint.
+		this.rowPorts = [];
+		for (let r = 0; r < rows; r++) {
+			for (const side of ["left", "right"] as const) {
+				const port = root.createDiv({
+					cls: `cp-row-port cp-row-port-${side}`,
+					attr: { "aria-label": "Drag to connect this row" },
+				});
+				this.bindRowPort(port, side, r);
+				this.rowPorts.push({ el: port, side, row: r });
+			}
+		}
+
 		// Insert dots: one per internal borderline; click inserts a row/column there.
 		this.insertColDots = [];
 		this.insertRowDots = [];
@@ -4521,18 +4695,22 @@ class TableWidget {
 	}
 
 	private updateChrome(e: PointerEvent) {
-		if (!this.nodeEl.hasClass("is-focused")) {
-			this.hideChrome();
-			return;
-		}
 		const t = this.tableEl;
 		if (!t || !t.isConnected) return;
 		const rect = t.getBoundingClientRect();
 		const M = 48; // keep edge chrome alive a little outside the table
-		if (
-			e.clientX < rect.left - M || e.clientX > rect.right + M ||
-			e.clientY < rect.top - M || e.clientY > rect.bottom + M
-		) {
+		const near =
+			e.clientX >= rect.left - M && e.clientX <= rect.right + M &&
+			e.clientY >= rect.top - M && e.clientY <= rect.bottom + M;
+		// Connection ports follow the pointer alone — unlike the editing chrome,
+		// they don't require the node to be selected first.
+		for (const p of this.rowPorts) p.el.toggleClass("is-visible", near);
+		this.setPortsHot(near && this.nearRowPort(e));
+		if (!this.nodeEl.hasClass("is-focused")) {
+			this.hideChrome();
+			return;
+		}
+		if (!near) {
 			this.hideChrome();
 			return;
 		}
@@ -4577,6 +4755,47 @@ class TableWidget {
 		this.insertLineEl?.hide();
 	}
 
+	private static readonly PORT_GRAB_PX = 18;
+
+	private nearRowPort(e: PointerEvent): boolean {
+		for (const p of this.rowPorts) {
+			const r = p.el.getBoundingClientRect();
+			if (!r.width) continue;
+			const d = Math.hypot(
+				e.clientX - (r.left + r.width / 2),
+				e.clientY - (r.top + r.height / 2)
+			);
+			if (d <= TableWidget.PORT_GRAB_PX) return true;
+		}
+		return false;
+	}
+
+	/**
+	 * Obsidian's interaction layer (the resize strips along every node edge) sits
+	 * above all node content and would swallow clicks on the ports. Lift the node
+	 * over it only while the pointer is actually on a port, so edge-resizing keeps
+	 * working everywhere else.
+	 */
+	private setPortsHot(hot: boolean) {
+		if (hot === this.portsHot) return;
+		this.portsHot = hot;
+		if (hot) {
+			this.prevNodeZ = this.nodeEl.style.zIndex;
+			this.nodeEl.style.zIndex = String(this.interactionLayerZ() + 1);
+		} else {
+			this.nodeEl.style.zIndex = this.prevNodeZ ?? "";
+			this.prevNodeZ = null;
+		}
+	}
+
+	private interactionLayerZ(): number {
+		const layer = this.tb.view.canvas?.wrapperEl.querySelector<HTMLElement>(
+			".canvas-node-interaction-layer"
+		);
+		const z = layer ? Number(getComputedStyle(layer).zIndex) : NaN;
+		return isFinite(z) ? z : 1000;
+	}
+
 	// --- insert between rows/columns ---
 
 	private bindInsert(dot: HTMLElement, axis: "row" | "col", boundary: number) {
@@ -4593,6 +4812,7 @@ class TableWidget {
 			} else {
 				this.cells.splice(boundary + 1, 0, this.cells[0].map(() => ""));
 				this.rowH.splice(boundary + 1, 0, TABLE_CELL_H);
+				this.remapEdgeRows((r) => (r > boundary ? r + 1 : r));
 			}
 			this.save();
 		});
@@ -4715,7 +4935,87 @@ class TableWidget {
 				d.setCssStyles({ left: "-12px" });
 			}
 		});
+		this.rowPorts.forEach((p) => {
+			const tr = t.rows[p.row];
+			if (!tr) return;
+			p.el.style.top = `${tr.offsetTop + tr.offsetHeight / 2}px`;
+			p.el.style.left = p.side === "left" ? "0px" : `${tw}px`;
+		});
 		this.positionDeleteBtn(); // follow the handle as the grid re-lays out
+	}
+
+	/** Drag from a row port to connect that row, using Obsidian's own edge drag. */
+	private bindRowPort(port: HTMLElement, side: "left" | "right", row: number) {
+		port.addEventListener("pointerenter", () => {
+			lastRowPortHover = { node: this.node, row, at: Date.now() };
+		});
+		port.addEventListener("pointerdown", (e) => {
+			if (e.button !== 0) return;
+			e.stopPropagation();
+			const canvas = this.tb.view.canvas;
+			if (typeof this.node.onConnectionPointerdown !== "function") return;
+			this.persistSizes(); // the row band is derived from the stored row heights
+			const before = canvas?.edges ? new Set(canvas.edges.keys()) : null;
+			this.node.onConnectionPointerdown(e, side);
+			if (!before) return;
+			// Obsidian draws the drag preview as a real edge, so claim it the moment
+			// it appears — then the preview runs from the row, not the side midpoint.
+			let settled = false;
+			const tick = () => {
+				if (settled) return;
+				if (this.stampNewEdge(before, row, false)) settled = true;
+				else window.requestAnimationFrame(tick);
+			};
+			window.requestAnimationFrame(tick);
+			this.doc.addEventListener(
+				"pointerup",
+				() => {
+					settled = true;
+					window.setTimeout(() => this.stampNewEdge(before, row, true), 0);
+				},
+				{ once: true, capture: true }
+			);
+		});
+	}
+
+	/** Tag the edge the drag just created with the row it started from. */
+	private stampNewEdge(before: Set<string>, row: number, save: boolean): boolean {
+		const canvas = this.tb.view.canvas;
+		if (!canvas?.edges) return false;
+		let found = false;
+		for (const [id, edge] of canvas.edges) {
+			if (before.has(id)) continue;
+			const end =
+				edge.from?.node === this.node
+					? "from"
+					: edge.to?.node === this.node
+						? "to"
+						: null;
+			if (!end) continue;
+			found = true;
+			if (edgeRowOf(edge, end) !== row) setEdgeRow(edge, end, row);
+			patchEdgeForRows(edge);
+			edge.render?.();
+			if (save) canvas.requestSave?.();
+		}
+		return found;
+	}
+
+	/** Keep row-anchored edges on the same row after rows shift (null = detach). */
+	private remapEdgeRows(map: (row: number) => number | null) {
+		const canvas = this.tb.view.canvas;
+		if (!canvas?.edges) return;
+		for (const edge of canvas.edges.values()) {
+			let touched = false;
+			for (const end of ["from", "to"] as const) {
+				if (edge[end]?.node !== this.node) continue;
+				const row = edgeRowOf(edge, end);
+				if (row === null) continue;
+				setEdgeRow(edge, end, map(row));
+				touched = true;
+			}
+			if (touched) edge.render?.();
+		}
 	}
 
 	/** Drag a divider to resize the column left of / row above it. */
@@ -4957,6 +5257,12 @@ class TableWidget {
 						this.cells.splice(target, 0, row);
 						const [h] = this.rowH.splice(index, 1);
 						this.rowH.splice(target, 0, h);
+						this.remapEdgeRows((r) => {
+							if (r === index) return target;
+							if (index < target && r > index && r <= target) return r - 1;
+							if (target < index && r >= target && r < index) return r + 1;
+							return r;
+						});
 					} else {
 						for (const row of this.cells) {
 							const [cell] = row.splice(index, 1);
@@ -5073,6 +5379,7 @@ class TableWidget {
 		if (axis === "row") {
 			this.cells.splice(index, 1);
 			this.rowH.splice(index, 1);
+			this.remapEdgeRows((r) => (r === index ? null : r > index ? r - 1 : r));
 		} else {
 			for (const row of this.cells) row.splice(index, 1);
 			this.colW.splice(index, 1);
@@ -5138,6 +5445,33 @@ class TableWidget {
 			else this.tb.refreshNodeStyles();
 		}, 150);
 	}
+}
+
+/** Obsidian's preset node colors, in the order its color picker shows them. */
+const CANVAS_PRESET_COLORS = ["red", "orange", "yellow", "green", "cyan", "purple"];
+
+/**
+ * Paint the table's grid lines in the node's canvas color (none = theme border).
+ * Obsidian publishes the picked color as --canvas-color on the node element, as
+ * an "r, g, b" triplet; a custom color is kept verbatim in the node data.
+ */
+function applyTableColor(node: CanvasNodeLike, el: HTMLElement) {
+	const color = (node.getData?.().color ?? node.unknownData?.color) as unknown;
+	const picked = typeof color === "string" ? color.trim() : "";
+	let css: string | null = null;
+	if (picked.startsWith("#")) {
+		css = picked;
+	} else if (picked) {
+		const raw = getComputedStyle(el).getPropertyValue("--canvas-color").trim();
+		if (/^[\d.]+\s*,\s*[\d.]+\s*,\s*[\d.]+$/.test(raw)) css = `rgb(${raw})`;
+		else if (raw) css = raw;
+		else {
+			const name = CANVAS_PRESET_COLORS[Number(picked) - 1];
+			if (name) css = `rgb(var(--color-${name}-rgb))`;
+		}
+	}
+	if (css) el.style.setProperty("--cp-table-line", css);
+	else el.style.removeProperty("--cp-table-line");
 }
 
 function canvasScale(canvas: CanvasLike): number {

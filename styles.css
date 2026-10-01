@@ -777,7 +777,10 @@ body .canvas-node.canvas-pencil-table.is-focused .canvas-node-container {
 }
 
 .cp-table td {
-	border: 1px solid var(--background-modifier-border);
+	/* longhands: an unresolvable --cp-table-line must not drop the border itself */
+	border-width: 1px;
+	border-style: solid;
+	border-color: var(--cp-table-line, var(--background-modifier-border));
 	padding: 4px 8px;
 	vertical-align: top;
 	font-size: var(--font-text-size);
@@ -953,6 +956,51 @@ body .canvas-node.canvas-pencil-table.is-focused .canvas-node-container {
 .cp-table-handle.is-dragging::before,
 .cp-table-handle.is-dragging::after {
 	opacity: 1;
+}
+
+/* per-row connection ports on the left/right edges — one per table row, so an
+   edge can attach to a single row instead of the node's side midpoint */
+
+.cp-row-port {
+	position: absolute;
+	z-index: 5;
+	width: 9px;
+	height: 9px;
+	border-radius: 50%;
+	background: var(--background-primary);
+	border: 2px solid var(--interactive-accent);
+	transform: translate(-50%, -50%);
+	opacity: 0;
+	pointer-events: none;
+	cursor: crosshair;
+	transition: opacity 120ms ease, transform 120ms ease, background 120ms ease;
+}
+
+body .canvas-node.canvas-pencil-table:hover .cp-row-port,
+body .canvas-node.canvas-pencil-table.is-focused .cp-row-port,
+body .canvas-node.canvas-pencil-table.is-selected .cp-row-port,
+.cp-row-port.is-visible {
+	opacity: 1;
+	pointer-events: auto;
+}
+
+.cp-row-port:hover {
+	background: var(--interactive-accent);
+	transform: translate(-50%, -50%) scale(1.35);
+}
+
+/* generous grab area around the small circle */
+.cp-row-port::before {
+	content: "";
+	position: absolute;
+	inset: -7px;
+	border-radius: 50%;
+}
+
+/* cell editing takes over the node — keep the ports out of the way */
+body .canvas-node.canvas-pencil-table.cp-cell-editing .cp-row-port {
+	opacity: 0;
+	pointer-events: none;
 }
 
 /* cell-resize dividers: invisible hit strips over the grid lines */
